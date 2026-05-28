@@ -1,0 +1,11 @@
+# Build for the ARM Cortex-M33 core of the RP2350 (Pico 2 W).
+[build]
+target = "thumbv8m.main-none-eabihf"
+
+[target.thumbv8m.main-none-eabihf]
+# No debug probe available, so we flash via the BOOTSEL drag-and-drop method.
+# `elf2uf2-rs -d` converts the built ELF to UF2 and, if a board is mounted in
+# BOOTSEL mode, copies it straight onto the board. Without -d it just writes
+# the .uf2 next to the ELF. We keep -d so `cargo run` deploys automatically
+# when the board is in BOOTSEL mode.
+runner = "elf2uf2-rs -d"

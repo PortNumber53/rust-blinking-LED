@@ -1,0 +1,45 @@
+[package]
+name = "rustic_base"
+version = "0.1.0"
+edition = "2021"
+description = "Blink the onboard LED on a Raspberry Pi Pico 2 W (RP2350 + CYW43)"
+
+[dependencies]
+# Async embedded framework + RP2350 HAL.
+embassy-executor = { version = "0.10", features = [
+    "platform-cortex-m",
+    "executor-thread",
+    "executor-interrupt",
+] }
+embassy-time = { version = "0.5" }
+embassy-rp = { version = "0.10", features = [
+    "rp235xa",        # Pico 2 / Pico 2 W use the RP2350A
+    "time-driver",
+    "critical-section-impl",
+    "binary-info",    # enables the embassy_rp::binary_info module (picotool metadata)
+] }
+
+# The onboard LED is wired to the CYW43 wireless chip, not an RP2350 GPIO,
+# so we must drive the CYW43 to toggle it.
+cyw43 = { version = "0.7" }
+cyw43-pio = { version = "0.10" }
+
+embassy-futures = "0.1"
+static_cell = "2.1"
+portable-atomic = { version = "1.13", features = ["critical-section"] }
+
+# Cortex-M runtime + panic handling.
+cortex-m = { version = "0.7", features = ["inline-asm"] }
+cortex-m-rt = "0.7"
+panic-halt = "1.0"
+
+[profile.release]
+opt-level = "s"     # optimize for size (firmware lives in limited flash)
+lto = true          # link-time optimization
+debug = 2           # keep debug info in the ELF (stripped from the UF2)
+codegen-units = 1
+overflow-checks = true
+
+[profile.dev]
+opt-level = 1       # opt-level 0 is often too slow/large for embedded
+debug = 2
