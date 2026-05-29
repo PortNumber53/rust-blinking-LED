@@ -1,18 +1,59 @@
-# rustic_base — Pico 2 W onboard LED blink (Rust)
+# pico-proxy — Pico 2 W captive-portal Wi-Fi selector (Rust)
 
-A minimal `no_std` Rust firmware that blinks the **onboard LED of a Raspberry Pi
-Pico 2 W** (RP2350). Built on [Embassy](https://embassy.dev/).
+A `no_std` Rust firmware for the **Raspberry Pi Pico 2 W** (RP2350 + CYW43439)
+that turns the board into a self-hosted **captive portal**: it broadcasts its own
+Wi-Fi access point, serves a web page that lists nearby Wi-Fi networks, and lets
+you pick one (with its password) for the Pico to connect to. Built on
+[Embassy](https://embassy.dev/) with [`embassy-net`](https://crates.io/crates/embassy-net).
 
-## Why this needs the WiFi chip
+> This is the first milestone. It goes as far as **joining the chosen upstream
+> network and confirming internet reachability**. It does **not** yet forward or
+> NAT the connected clients' traffic to the upstream — see *Roadmap* below.
 
-On the Pico 2 W the user LED is **not** wired to an RP2350 GPIO — it hangs off
-**GPIO 0 of the CYW43439 wireless chip**. So even "just blink an LED" requires
-bringing up the CYW43 over its PIO-driven SPI link and loading the WiFi firmware
-blob. The blobs in [`cyw43-firmware/`](cyw43-firmware/) are baked into the binary
-at compile time and are required to build.
+## How it works
 
-> A plain Pico 2 (non-W) puts the LED on GPIO 25 — this firmware will **not**
-> blink it. That board needs a regular `gpio::Output` instead.
+The CYW43439 has a **single radio** that can be a Wi-Fi access point *or* a Wi-Fi
+client, but not robustly both at once. So the firmware runs in two time-separated
+phases:
+
+1. **Config phase (AP + captive portal).** On boot the Pico starts an open AP
+   named **`Pico-Proxy`**. It runs three network services on its own stack
+   (static IP `192.168.4.1/24`):
+   - a minimal **DHCP server** ([`src/dhcp_server.rs`](src/dhcp_server.rs)) that
+     leases `192.168.4.x` addresses and advertises the Pico as router + DNS;
+   - a **catch-all DNS server** ([`src/dns_server.rs`](src/dns_server.rs)) that
+     answers every query with `192.168.4.1`, so OS captive-portal probes trigger
+     the login page;
+   - an **HTTP server** ([`src/http.rs`](src/http.rs)) serving the portal page
+     ([`src/portal.html`](src/portal.html)), a `/networks` scan list, a
+     `/connect` form handler, and a `/status` poll endpoint. Unknown paths 302-
+     redirect to `/` (this is what pops the captive portal on phones).
+
+2. **Run phase (STA / client).** When you pick a network and submit the form, the
+   Pico tears down the AP (`close_ap`), reconfigures its IP stack for DHCP, and
+   joins the chosen network as a client. It then waits for a DHCP lease and
+   resolves a known host to confirm it's online. To reconfigure, reboot the board
+   (which restarts in the config phase).
+
+### Onboard LED status
+
+The onboard LED (CYW43 GPIO 0) is a coarse status indicator:
+
+| Pattern      | Meaning                                            |
+| ------------ | -------------------------------------------------- |
+| Slow blink   | AP up, portal waiting for you to pick a network    |
+| Fast blink   | Connecting to the chosen upstream network          |
+| Solid on     | Connected and internet reachability confirmed      |
+
+## Using it
+
+1. Flash the firmware (see below) and power the board.
+2. On a phone/laptop, join the open Wi-Fi network **`Pico-Proxy`**. A captive-
+   portal page should pop up automatically; if not, browse to
+   <http://192.168.4.1/>.
+3. Pick a network from the list, enter its password (leave blank for open
+   networks), and tap **Connect**. The page reports progress; the AP drops while
+   the Pico switches to the chosen network, which is expected.
 
 ## Toolchain
 
@@ -27,41 +68,75 @@ cargo install elf2uf2-rs                       # ELF -> UF2 converter
 cargo build --release
 ```
 
-Produces `target/thumbv8m.main-none-eabihf/release/rustic_base` (ELF).
+Produces `target/thumbv8m.main-none-eabihf/release/rustic_base` (ELF). The crate
+is still named `rustic_base`; the program identifies itself as `pico-proxy` in
+`picotool info`.
 
 ## Flash (no debug probe required)
 
 1. **Unplug** the board if connected.
 2. Hold the **BOOTSEL** button, plug in USB, then release. The board mounts as a
    USB drive named **`RP2350`**.
-3. Convert + copy the firmware:
+3. Run the flash script — it builds, converts to UF2, **patches the family ID**
+   (see the gotcha below), and copies it onto the mounted board:
 
    ```sh
-   elf2uf2-rs target/thumbv8m.main-none-eabihf/release/rustic_base rustic_base.uf2
-   cp rustic_base.uf2 /Volumes/RP2350/      # macOS
+   ./scripts/flash.sh             # release build, auto-flash if board mounted
+   ./scripts/flash.sh --debug     # debug build
+   ./scripts/flash.sh --no-copy   # build + patch only (writes ./pico-proxy.uf2)
    ```
 
 When the bootloader accepts the image it flashes and reboots automatically — the
-`RP2350` drive disappears. The LED then blinks at ~2 Hz (250 ms on / 250 ms off).
+`RP2350` drive disappears and the open **`Pico-Proxy`** Wi-Fi network appears.
 
-### ⚠️ Gotcha: UF2 family ID
+### ⚠️ Gotcha: UF2 family ID (why you need `flash.sh`)
 
 The RP2350 bootloader only accepts UF2 images tagged with the **RP2350 ARM-S**
-family ID `0xe48bff59`. Older builds of `elf2uf2-rs` hardcode the **RP2040** ID
-`0xe48bff56`, which the RP2350 bootloader silently **rejects** (the `.uf2` just
-sits on the drive and the board never reboots).
+family ID `0xe48bff59`. Older builds of `elf2uf2-rs` (including the one this
+project was developed against) hardcode the **RP2040** ID `0xe48bff56`, which the
+RP2350 bootloader silently **rejects** — the `.uf2` just sits on the drive and the
+board never reboots. This is *silent*: there's no error, the flash simply doesn't
+take, so it's easy to mistake for a firmware bug.
 
-If your `elf2uf2-rs` is old, either upgrade it, use `picotool`, or patch the
-family ID in every 512-byte UF2 block (`0xe48bff56` -> `0xe48bff59`). A
-debug-probe workflow (`probe-rs run --chip RP235x`) sidesteps this entirely.
+[`scripts/flash.sh`](scripts/flash.sh) works around this by rewriting every
+512-byte UF2 block's family-ID field from `0xe48bff56` to `0xe48bff59` after
+`elf2uf2-rs` runs (validating the UF2 block magic first). If you instead have a
+recent `elf2uf2-rs`, `picotool`, or a debug probe (`probe-rs run --chip RP235x`),
+those sidestep the issue and you can flash directly without the script.
+
+> Note: `cargo run --release` uses the `elf2uf2-rs -d` runner, which on this
+> machine produces the **wrong** (RP2040) family ID and so will silently fail to
+> flash a Pico 2 W. Use `./scripts/flash.sh` instead.
+
+> **Debugging tip:** this firmware uses `panic-halt`, so a panic or a failed
+> CYW43 bring-up halts silently with no output. If you have a debug probe, switch
+> the panic handler to `panic-probe` + `defmt-rtt` and add `-Tdefmt.x` in
+> `build.rs` to get logs over RTT.
+
+## Roadmap
+
+- [x] AP + captive portal (DHCP, catch-all DNS, HTTP).
+- [x] Scan nearby networks, pick one, join as client, confirm reachability.
+- [ ] **Forward/NAT** connected clients' traffic to the upstream. This requires
+      concurrent AP+STA on the single radio (experimental in cyw43) plus a NAT
+      layer (smoltcp has none built in), and is the main deferred piece.
+- [ ] Persist the chosen network to flash so a reboot reconnects automatically.
 
 ## Project layout
 
-| Path                 | Purpose                                                  |
-| -------------------- | -------------------------------------------------------- |
-| `src/main.rs`        | The blink program (drives LED via CYW43 GPIO 0).         |
-| `Cargo.toml`         | Embassy 0.10 + cyw43 0.7 dependencies.                   |
-| `.cargo/config.toml` | Build target + `elf2uf2-rs` runner.                      |
-| `build.rs`           | Places `memory.x` on the linker path + linker args.      |
-| `memory.x`           | RP2350 memory layout (4 MiB flash) + boot blocks.        |
-| `cyw43-firmware/`    | CYW43439 firmware blobs (required to control the LED).   |
+| Path                   | Purpose                                                       |
+| ---------------------- | ------------------------------------------------------------- |
+| `src/main.rs`          | CYW43 bring-up, task spawning, AP→STA state machine, LED.     |
+| `src/net.rs`           | embassy-net stack init, runner tasks, AP/DHCP reconfigure.    |
+| `src/dhcp_server.rs`   | Minimal DHCPv4 server for AP clients.                         |
+| `src/dns_server.rs`    | Catch-all DNS responder for the captive portal.              |
+| `src/http.rs`          | HTTP/1.1 server: portal, scan list, connect, status.         |
+| `src/portal.html`      | The portal web page (embedded via `include_str!`).           |
+| `src/wifi.rs`          | Wi-Fi scan (dedup + sort) and join helpers.                   |
+| `src/shared.rs`        | Cross-task state (scan results, connect request, status).    |
+| `scripts/flash.sh`     | Build + UF2 + family-ID patch + flash to a BOOTSEL board.     |
+| `Cargo.toml`           | Embassy 0.10 + cyw43 0.7 + embassy-net 0.9 dependencies.      |
+| `.cargo/config.toml`   | Build target + `elf2uf2-rs` runner.                           |
+| `build.rs`             | Places `memory.x` on the linker path + linker args.          |
+| `memory.x`             | RP2350 memory layout (4 MiB flash) + boot blocks.            |
+| `cyw43-firmware/`      | CYW43439 firmware blobs (required to build).                  |

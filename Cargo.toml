@@ -2,7 +2,7 @@
 name = "rustic_base"
 version = "0.1.0"
 edition = "2021"
-description = "Blink the onboard LED on a Raspberry Pi Pico 2 W (RP2350 + CYW43)"
+description = "Pico 2 W captive-portal WiFi network selector (RP2350 + CYW43)"
 
 [dependencies]
 # Async embedded framework + RP2350 HAL.
@@ -24,9 +24,30 @@ embassy-rp = { version = "0.10", features = [
 cyw43 = { version = "0.7" }
 cyw43-pio = { version = "0.10" }
 
+# TCP/IP stack. cyw43 0.7 exposes an embassy-net Ethernet-medium driver; the
+# matching embassy-net is 0.9 (released in the same batch as cyw43 0.7).
+#   - proto-ipv4 + medium-ethernet: required by the cyw43 driver.
+#   - tcp: the HTTP captive-portal server (port 80).
+#   - udp: our hand-rolled DHCP server (port 67) and DNS catch-all (port 53).
+#   - dhcpv4: the *client* used once we switch to STA mode to get an upstream lease.
+#   - dns: the resolver used to confirm internet reachability after joining.
+embassy-net = { version = "0.9", features = [
+    "proto-ipv4",
+    "medium-ethernet",
+    "tcp",
+    "udp",
+    "dhcpv4",
+    "dns",
+] }
+
 embassy-futures = "0.1"
+embassy-sync = "0.8"
 static_cell = "2.1"
 portable-atomic = { version = "1.13", features = ["critical-section"] }
+heapless = "0.9"
+embedded-io-async = "0.7"
+# RoscRng implements rand_core 0.9's RngCore (matches embassy-rp 0.10).
+rand_core = "0.9"
 
 # Cortex-M runtime + panic handling.
 cortex-m = { version = "0.7", features = ["inline-asm"] }

@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pico Proxy Setup</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 1.2rem; max-width: 30rem; margin-inline: auto; }
+  h1 { font-size: 1.3rem; }
+  .net { display: flex; align-items: center; justify-content: space-between;
+         padding: .7rem .9rem; border: 1px solid #8884; border-radius: .6rem; margin: .4rem 0; cursor: pointer; }
+  .net.sel { border-color: #3b82f6; background: #3b82f622; }
+  .bars { font-variant-numeric: tabular-nums; opacity: .7; font-size: .85rem; }
+  label { display: block; margin: .8rem 0 .3rem; font-weight: 600; }
+  input { width: 100%; padding: .6rem; font-size: 1rem; border: 1px solid #8886; border-radius: .5rem; box-sizing: border-box; }
+  button { width: 100%; padding: .8rem; font-size: 1rem; margin-top: 1rem; border: 0; border-radius: .5rem;
+           background: #3b82f6; color: #fff; font-weight: 600; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  #status { margin-top: 1rem; padding: .7rem; border-radius: .5rem; text-align: center; font-weight: 600; display: none; }
+  .ok { background: #16a34a22; color: #16a34a; }
+  .err { background: #dc262622; color: #dc2626; }
+  .info { background: #3b82f622; color: #3b82f6; }
+  small { opacity: .6; }
+</style>
+</head>
+<body>
+<h1>Pico Proxy &mdash; choose a network</h1>
+<p><small>Pick the Wi-Fi network this device should route through, then enter its password.</small></p>
+
+<div id="list"><small>Scanning&hellip;</small></div>
+
+<label for="pwd">Password <small>(leave blank for open networks)</small></label>
+<input id="pwd" type="password" autocomplete="off" placeholder="Wi-Fi password">
+
+<button id="connect" disabled>Connect</button>
+<div id="status"></div>
+
+<script>
+let selected = null;
+
+function bars(rssi) {
+  if (rssi >= -55) return "████";
+  if (rssi >= -65) return "███░";
+  if (rssi >= -75) return "██░░";
+  if (rssi >= -85) return "█░░░";
+  return "░░░░";
+}
+
+async function loadNetworks() {
+  try {
+    const r = await fetch('/networks', { cache: 'no-store' });
+    const nets = await r.json();
+    const list = document.getElementById('list');
+    if (!nets.length) { list.innerHTML = '<small>No networks found. <a href="/">Rescan</a></small>'; return; }
+    list.innerHTML = '';
+    for (const n of nets) {
+      const div = document.createElement('div');
+      div.className = 'net';
+      div.innerHTML = '<span></span><span class="bars">' + bars(n.rssi) + ' ' + n.rssi + 'dBm</span>';
+      div.firstChild.textContent = n.ssid;
+      div.onclick = () => {
+        document.querySelectorAll('.net').forEach(e => e.classList.remove('sel'));
+        div.classList.add('sel');
+        selected = n.ssid;
+        document.getElementById('connect').disabled = false;
+      };
+      list.appendChild(div);
+    }
+  } catch (e) {
+    document.getElementById('list').innerHTML = '<small>Scan not ready, retrying&hellip;</small>';
+    setTimeout(loadNetworks, 1500);
+  }
+}
+
+function showStatus(cls, msg) {
+  const s = document.getElementById('status');
+  s.style.display = 'block';
+  s.className = cls;
+  s.textContent = msg;
+}
+
+async function pollStatus() {
+  try {
+    const r = await fetch('/status', { cache: 'no-store' });
+    const j = await r.json();
+    if (j.status === 'connected') { showStatus('ok', 'Connected! This device is now online.'); return; }
+    if (j.status === 'failed') { showStatus('err', 'Connection failed. Check the password and try again.');
+      document.getElementById('connect').disabled = false; return; }
+    if (j.status === 'connecting') { showStatus('info', 'Connecting…'); }
+  } catch (e) { /* AP may drop while switching; keep polling */ }
+  setTimeout(pollStatus, 1500);
+}
+
+document.getElementById('connect').onclick = async () => {
+  if (!selected) return;
+  document.getElementById('connect').disabled = true;
+  showStatus('info', 'Connecting…');
+  const pwd = document.getElementById('pwd').value;
+  const body = 'ssid=' + encodeURIComponent(selected) + '&password=' + encodeURIComponent(pwd);
+  try {
+    await fetch('/connect', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body });
+  } catch (e) { /* the AP often drops right after we submit; that's expected */ }
+  pollStatus();
+};
+
+loadNetworks();
+</script>
+</body>
+</html>
