@@ -19,6 +19,7 @@ use embedded_io_async::Write;
 use heapless::String;
 
 use crate::dhcp_server::SERVER_IP;
+use crate::ipc;
 use crate::shared::{self, ConnectRequest, PASSWORD_MAX};
 use crate::wifi::SSID_MAX;
 
@@ -116,6 +117,9 @@ async fn handle_request(socket: &mut TcpSocket<'_>, req: &[u8]) {
         ("POST", "/connect") => {
             handle_connect(socket, req).await;
         }
+        ("POST", "/blink") => {
+            handle_blink(socket, req).await;
+        }
         // Captive-portal probes and anything else → redirect to the portal.
         _ => {
             send_redirect(socket).await;
@@ -175,6 +179,39 @@ async fn handle_connect(socket: &mut TcpSocket<'_>, req: &[u8]) {
     shared::CONNECT.signal(ConnectRequest { ssid, password });
 
     send_response(socket, "200 OK", "application/json", b"{\"ok\":true}").await;
+}
+
+/// Parse `msg=...` from the POST body and hand it to core1 to blink in Morse.
+async fn handle_blink(socket: &mut TcpSocket<'_>, req: &[u8]) {
+    let body = match find_subslice(req, b"\r\n\r\n") {
+        Some(idx) => &req[idx + 4..],
+        None => b"",
+    };
+
+    // Extract the single `msg` field (URL-encoded) into a bounded buffer.
+    let mut msg: ipc::Message = heapless::String::new();
+    if let Ok(text) = core::str::from_utf8(body) {
+        for pair in text.split('&') {
+            let mut kv = pair.splitn(2, '=');
+            if kv.next() == Some("msg") {
+                url_decode_into(kv.next().unwrap_or(""), &mut msg);
+            }
+        }
+    }
+
+    if msg.is_empty() {
+        send_response(socket, "400 Bad Request", "text/plain", b"empty message").await;
+        return;
+    }
+
+    // Non-blocking: if core1's queue is briefly full, report busy rather than
+    // stalling the HTTP task.
+    match ipc::MSG.try_send(msg) {
+        Ok(()) => send_response(socket, "200 OK", "application/json", b"{\"ok\":true}").await,
+        Err(_) => {
+            send_response(socket, "503 Service Unavailable", "text/plain", b"busy").await
+        }
+    }
 }
 
 /// Send a 302 redirect to the portal root at the AP IP. Used for captive probes.

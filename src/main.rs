@@ -1,23 +1,27 @@
-//! Pico 2 W captive-portal Wi-Fi network selector.
+//! Pico 2 W captive-portal Wi-Fi selector — dual-core edition.
 //!
-//! Boots as an open Wi-Fi access point ("Pico-Proxy") running a captive portal.
-//! A user joins the AP, the portal page pops up, lists nearby Wi-Fi networks,
-//! and lets them pick one + enter its password. The Pico then drops the AP,
-//! switches the single CYW43 radio to client (STA) mode, joins the chosen
-//! network, and confirms internet reachability. Reboot to reconfigure.
+//! The RP2350 has two Cortex-M33 cores, and this firmware splits work across
+//! them:
+//!   - **core0** owns the radio and the entire network stack: cyw43 bring-up,
+//!     the cyw43 + embassy-net runners, the DHCP/DNS/HTTP service tasks, and the
+//!     AP→STA state machine. It MUST be core0 because `embassy_rp::init` runs
+//!     here and unmasks the timer alarm IRQ (and the cyw43 PIO/DMA IRQs) only in
+//!     core0's NVIC — the RP2350 NVIC is per-core, so async drivers that await
+//!     timers/peripherals only make progress on core0.
+//!   - **core1** runs the application: a Morse-code status indicator. It receives
+//!     network-status events from core0 and blinks the current state on the
+//!     onboard LED in Morse, by sending LED on/off commands back to core0 (which
+//!     owns the CYW43 GPIO). core1 uses `block_for` busy-wait timing, since
+//!     `Timer` doesn't work off-core. So the LED's meaning is computed on core1
+//!     and the toggle happens on core0 — a visible proof of the cross-core link.
 //!
-//! Why a config-then-switch flow: the CYW43439 has ONE radio. It can be an AP or
-//! a client, not robustly both at once. So the portal (phone joins the Pico) and
-//! the upstream join (Pico joins a router) are time-separated into two phases.
+//! The Wi-Fi behavior is unchanged from the single-core version: boot as the
+//! open AP "Pico-Proxy" with a captive portal, let the user pick a network, then
+//! switch to client mode and confirm reachability. Reboot to reconfigure.
 //!
-//! This milestone stops at "joined + reachable". It does NOT yet forward/NAT the
-//! connected clients' traffic to the upstream — that requires concurrent AP+STA
-//! and a NAT layer smoltcp doesn't provide, and is deferred.
-//!
-//! Onboard LED (CYW43 GPIO 0) is a coarse status indicator:
-//!   - slow blink : AP up, portal waiting for a selection
-//!   - fast blink : connecting to the chosen upstream
-//!   - solid on   : connected + internet confirmed
+//! Morse status words (blinked on the LED, computed by core1):
+//!   Portal → "AP", Scanning → "S", Connecting → "C",
+//!   Connected → "OK", Failed → "ERR".
 
 #![no_std]
 #![no_main]
@@ -25,37 +29,34 @@
 mod dhcp_server;
 mod dns_server;
 mod http;
+mod ipc;
+mod morse;
 mod net;
 mod shared;
 mod wifi;
 
+use core::ptr::addr_of_mut;
+
 use cyw43::aligned_bytes;
 use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
-use embassy_executor::Spawner;
+use embassy_executor::{Executor, Spawner};
 use embassy_rp::clocks::RoscRng;
 use embassy_rp::gpio::{Level, Output};
+use embassy_rp::multicore::spawn_core1;
 use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, PIO0};
 use embassy_rp::pio::{InterruptHandler, Pio};
 use embassy_rp::{bind_interrupts, dma};
-use embassy_time::{Duration, Timer};
 use static_cell::StaticCell;
-
-use shared::Status;
 
 // Halt on panic. With no debug probe there's nowhere to print a backtrace.
 use panic_halt as _;
-
-/// AP SSID. Open network — the captive portal is the gatekeeper.
-const AP_SSID: &str = "Pico-Proxy";
-/// 2.4 GHz channel for the AP. 6 is a common, widely-valid default.
-const AP_CHANNEL: u8 = 6;
 
 #[unsafe(link_section = ".bi_entries")]
 #[used]
 pub static PICOTOOL_ENTRIES: [embassy_rp::binary_info::EntryAddr; 4] = [
     embassy_rp::binary_info::rp_program_name!(c"pico-proxy"),
     embassy_rp::binary_info::rp_program_description!(
-        c"Captive-portal WiFi network selector for the Pico 2 W (CYW43)."
+        c"Dual-core captive-portal WiFi selector + Morse status (Pico 2 W)."
     ),
     embassy_rp::binary_info::rp_cargo_version!(),
     embassy_rp::binary_info::rp_program_build_attribute!(),
@@ -68,10 +69,26 @@ bind_interrupts!(struct Irqs {
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
+    // embassy_rp::init runs exactly once, on core0; it hands out all Peri tokens
+    // and unmasks the timer + (later) peripheral IRQs in core0's NVIC. All
+    // timer/radio-driven tasks therefore live on core0 (this executor).
     let p = embassy_rp::init(Default::default());
-    let mut rng = RoscRng;
 
-    // --- CYW43 bring-up (identical wiring to the original blink firmware) ---
+    // Bring up core1 first: it only runs the Morse app (no timers via the IRQ
+    // driver, no peripherals), so it needs no Peri tokens.
+    spawn_core1(
+        p.CORE1,
+        unsafe { &mut *addr_of_mut!(ipc::CORE1_STACK) },
+        || {
+            let executor1 = ipc::EXECUTOR1.init(Executor::new());
+            executor1.run(|spawner| {
+                spawner.spawn(morse::morse_task().unwrap());
+            });
+        },
+    );
+
+    // --- core0: CYW43 bring-up (same wiring as the original blink firmware) ---
+    let mut rng = RoscRng;
     let fw = aligned_bytes!("../cyw43-firmware/43439A0.bin");
     let clm = aligned_bytes!("../cyw43-firmware/43439A0_clm.bin");
     let nvram = aligned_bytes!("../cyw43-firmware/nvram_rp2040.bin");
@@ -94,7 +111,6 @@ async fn main(spawner: Spawner) {
     static STATE: StaticCell<cyw43::State> = StaticCell::new();
     let state = STATE.init(cyw43::State::new());
     let (net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw, nvram).await;
-    // Spawning at startup cannot realistically fail; panic-halt if it does.
     spawner.spawn(net::cyw43_task(runner).unwrap());
 
     control.init(clm).await;
@@ -102,144 +118,13 @@ async fn main(spawner: Spawner) {
         .set_power_management(cyw43::PowerManagementMode::PowerSave)
         .await;
 
-    // --- Network stack + service tasks ---
-    let seed = rng.next_u64();
-    let stack = net::init_stack(&spawner, net_device, seed);
-
+    // --- core0: network stack + service tasks ---
+    let stack = net::init_stack(&spawner, net_device, rng.next_u64());
     spawner.spawn(dhcp_server::dhcp_server_task(stack).unwrap());
     spawner.spawn(dns_server::dns_server_task(stack).unwrap());
     spawner.spawn(http::http_server_task(stack).unwrap());
 
-    // --- Phase 1: AP + captive portal ---
-    control.start_ap_open(AP_SSID, AP_CHANNEL).await;
-    shared::set_status(Status::Portal).await;
-    // Kick an initial scan so the list is ready when the first client connects.
-    shared::SCAN_REQUEST.signal(());
-
-    // Main state machine: handle scan requests and the one connect request.
-    run_state_machine(&mut control, stack).await;
-}
-
-/// The portal/connect state machine. Loops handling scans until the user submits
-/// a connect request, then performs the AP→STA switch and reports the result.
-async fn run_state_machine(
-    control: &mut cyw43::Control<'static>,
-    stack: embassy_net::Stack<'static>,
-) -> ! {
-    loop {
-        // Wait for either a scan request or a connect request, blinking the LED
-        // at the "portal" cadence while we wait.
-        let event = wait_for_event(control).await;
-
-        match event {
-            Event::Scan => {
-                shared::set_status(Status::Scanning).await;
-                let list = wifi::scan(control).await;
-                {
-                    let mut shared_list = shared::NETWORKS.lock().await;
-                    *shared_list = list;
-                }
-                shared::set_status(Status::Portal).await;
-            }
-            Event::Connect(req) => {
-                shared::set_status(Status::Connecting).await;
-                // Tear down the AP so the radio is free for client mode.
-                control.close_ap().await;
-                // Reconfigure the IP stack to obtain a lease from the upstream.
-                net::reconfigure_dhcp(stack);
-
-                let joined = wifi::join(control, req.ssid.as_str(), req.password.as_str())
-                    .await
-                    .is_ok();
-
-                if joined && confirm_online(control, stack).await {
-                    shared::set_status(Status::Connected).await;
-                    // Solid LED, then idle — the HTTP /status task keeps serving.
-                    control.gpio_set(0, true).await;
-                    idle_connected().await;
-                } else {
-                    // Roll back to the portal so the user can retry.
-                    shared::set_status(Status::Failed).await;
-                    let _ = control.leave().await;
-                    net::reconfigure_ap(stack);
-                    control.start_ap_open(AP_SSID, AP_CHANNEL).await;
-                    shared::set_status(Status::Portal).await;
-                    shared::SCAN_REQUEST.signal(());
-                }
-            }
-        }
-    }
-}
-
-/// An event the state machine reacts to.
-enum Event {
-    Scan,
-    Connect(shared::ConnectRequest),
-}
-
-/// Wait for a scan or connect signal, blinking the LED at the portal cadence.
-/// Returns as soon as either signal fires.
-async fn wait_for_event(control: &mut cyw43::Control<'static>) -> Event {
-    use embassy_futures::select::{select3, Either3};
-
-    let mut led = false;
-    loop {
-        let blink = Timer::after(Duration::from_millis(500));
-        match select3(shared::CONNECT.wait(), shared::SCAN_REQUEST.wait(), blink).await {
-            Either3::First(req) => return Event::Connect(req),
-            Either3::Second(()) => return Event::Scan,
-            Either3::Third(()) => {
-                led = !led;
-                control.gpio_set(0, led).await;
-            }
-        }
-    }
-}
-
-/// Confirm internet reachability: wait for a DHCP lease, then resolve a known
-/// hostname. Returns true if both succeed within a timeout.
-async fn confirm_online(
-    control: &mut cyw43::Control<'static>,
-    stack: embassy_net::Stack<'static>,
-) -> bool {
-    use embassy_futures::select::{select, Either};
-
-    // Fast blink while we wait for the lease + DNS.
-    let blink = async {
-        let mut led = false;
-        loop {
-            led = !led;
-            control.gpio_set(0, led).await;
-            Timer::after(Duration::from_millis(120)).await;
-        }
-    };
-
-    let work = async {
-        // Wait for DHCP to assign an address (link up + config up).
-        stack.wait_config_up().await;
-        // Resolve a well-known host as a liveness check.
-        match stack
-            .dns_query("example.com", embassy_net::dns::DnsQueryType::A)
-            .await
-        {
-            Ok(addrs) => !addrs.is_empty(),
-            Err(_) => false,
-        }
-    };
-
-    // Bound the whole check so a bad password / no-DHCP network doesn't hang.
-    let timeout = Timer::after(Duration::from_secs(25));
-    match select(select(work, timeout), blink).await {
-        Either::First(Either::First(ok)) => ok,    // work finished first
-        Either::First(Either::Second(())) => false, // timed out
-        Either::Second(()) => unreachable!(),       // blink never returns
-    }
-}
-
-/// After a successful connection, idle forever. The radio + stack + HTTP status
-/// task keep running; the user reboots to reconfigure.
-async fn idle_connected() -> ! {
-    loop {
-        Timer::after(Duration::from_secs(3600)).await;
-    }
+    // The state machine owns `control` (sole radio-GPIO owner): it runs the AP +
+    // captive portal, reports status to core1, and applies core1's LED commands.
+    spawner.spawn(net::network_task(control, stack).unwrap());
 }

@@ -10,6 +10,34 @@ you pick one (with its password) for the Pico to connect to. Built on
 > network and confirming internet reachability**. It does **not** yet forward or
 > NAT the connected clients' traffic to the upstream — see *Roadmap* below.
 
+## Dual-core architecture
+
+The RP2350 has two Cortex-M33 cores, and the firmware splits work across them:
+
+- **core0** owns the radio and the entire network stack (cyw43 bring-up, the
+  embassy-net runner, DHCP/DNS/HTTP, and the AP→STA state machine). It *must* be
+  core0: `embassy_rp::init()` runs there and unmasks the timer alarm IRQ and the
+  cyw43 PIO/DMA IRQs only in **core0's** NVIC. The RP2350 NVIC is per-core, so an
+  async task that awaits a `Timer` (or the cyw43 driver) only makes progress on
+  core0 — putting that work on core1 silently hangs.
+- **core1** runs the application: a **Morse-code status indicator**. It receives
+  network-status events from core0 and continuously blinks the current state on
+  the onboard LED in Morse (Portal→`AP`, Scanning→`S`, Connecting→`C`,
+  Connected→`OK`, Failed→`ERR`). You can also type a message in the portal and
+  core1 will blink it once before resuming the status pattern.
+
+Because the LED is a CYW43 GPIO owned by core0, core1 doesn't toggle it directly:
+it sends `SetLed` commands back to core0. So the LED's *meaning* is computed on
+core1 and the *action* happens on core0. The two cores communicate only through
+`embassy_sync` channels using `CriticalSectionRawMutex` (the only raw mutex sound
+across cores). core1 times its blinks with `embassy_time::block_for` (a busy-wait
+that polls the shared timer counter and needs no interrupt), since `Timer` only
+works on core0.
+
+> **Hardware constraint, learned the hard way:** the radio/timer stack cannot run
+> on core1. See the per-core NVIC explanation above — this is why core0 does the
+> networking and core1 does the (busy-wait-timed) Morse.
+
 ## How it works
 
 The CYW43439 has a **single radio** that can be a Wi-Fi access point *or* a Wi-Fi
@@ -26,8 +54,10 @@ phases:
      the login page;
    - an **HTTP server** ([`src/http.rs`](src/http.rs)) serving the portal page
      ([`src/portal.html`](src/portal.html)), a `/networks` scan list, a
-     `/connect` form handler, and a `/status` poll endpoint. Unknown paths 302-
-     redirect to `/` (this is what pops the captive portal on phones).
+     `/connect` form handler, a `/status` poll endpoint, and a `/blink` endpoint
+     (POST a message to blink it on the LED in Morse — see the dual-core section).
+     Unknown paths 302-redirect to `/` (this is what pops the captive portal on
+     phones).
 
 2. **Run phase (STA / client).** When you pick a network and submit the form, the
    Pico tears down the AP (`close_ap`), reconfigures its IP stack for DHCP, and
@@ -35,15 +65,22 @@ phases:
    resolves a known host to confirm it's online. To reconfigure, reboot the board
    (which restarts in the config phase).
 
-### Onboard LED status
+### Onboard LED status (Morse)
 
-The onboard LED (CYW43 GPIO 0) is a coarse status indicator:
+The onboard LED (CYW43 GPIO 0) blinks the current status as a Morse word, driven
+by core1 (see the dual-core section). Unit time is 150 ms (dot = 1 unit, dash = 3):
 
-| Pattern      | Meaning                                            |
-| ------------ | -------------------------------------------------- |
-| Slow blink   | AP up, portal waiting for you to pick a network    |
-| Fast blink   | Connecting to the chosen upstream network          |
-| Solid on     | Connected and internet reachability confirmed      |
+| State        | Morse word | Code              |
+| ------------ | ---------- | ----------------- |
+| Portal       | `AP`       | `.-` `.--.`       |
+| Scanning     | `S`        | `...`             |
+| Connecting   | `C`        | `-.-.`            |
+| Connected    | `OK`       | `---` `-.-`       |
+| Failed       | `ERR`      | `.` `.-.` `.-.`   |
+
+You can also type any message in the portal's **"Blink a message on the LED"**
+box; core1 blinks it once in Morse (letters, digits, punctuation), then resumes
+the status word.
 
 ## Using it
 
@@ -126,11 +163,13 @@ those sidestep the issue and you can flash directly without the script.
 
 | Path                   | Purpose                                                       |
 | ---------------------- | ------------------------------------------------------------- |
-| `src/main.rs`          | CYW43 bring-up, task spawning, AP→STA state machine, LED.     |
-| `src/net.rs`           | embassy-net stack init, runner tasks, AP/DHCP reconfigure.    |
+| `src/main.rs`          | Dual-core boot: spawn core1, bring up cyw43 + net on core0.   |
+| `src/ipc.rs`           | Cross-core channels (Cmd/Evt/Msg) + per-core executor statics.|
+| `src/morse.rs`         | core1 Morse generator: status words + portal messages.        |
+| `src/net.rs`           | embassy-net stack init, runner tasks, AP→STA state machine.   |
 | `src/dhcp_server.rs`   | Minimal DHCPv4 server for AP clients.                         |
 | `src/dns_server.rs`    | Catch-all DNS responder for the captive portal.              |
-| `src/http.rs`          | HTTP/1.1 server: portal, scan list, connect, status.         |
+| `src/http.rs`          | HTTP/1.1 server: portal, scan list, connect, status, blink.   |
 | `src/portal.html`      | The portal web page (embedded via `include_str!`).           |
 | `src/wifi.rs`          | Wi-Fi scan (dedup + sort) and join helpers.                   |
 | `src/shared.rs`        | Cross-task state (scan results, connect request, status).    |

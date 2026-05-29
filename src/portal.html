@@ -36,6 +36,16 @@
 <button id="connect" disabled>Connect</button>
 <div id="status"></div>
 
+<hr style="margin:1.6rem 0;border:0;border-top:1px solid #8884;">
+
+<h2 style="font-size:1.1rem;">Blink a message on the LED</h2>
+<p><small>Type a message — the second CPU core will blink it on the onboard LED in
+Morse code, then go back to showing the network status. Letters, digits, and
+punctuation are supported (max 64 characters).</small></p>
+<input id="msg" type="text" maxlength="64" placeholder="e.g. HELLO" autocomplete="off">
+<button id="blink">Blink it</button>
+<div id="blinkStatus"></div>
+
 <script>
 let selected = null;
 
@@ -102,6 +112,27 @@ document.getElementById('connect').onclick = async () => {
     await fetch('/connect', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body });
   } catch (e) { /* the AP often drops right after we submit; that's expected */ }
   pollStatus();
+};
+
+document.getElementById('blink').onclick = async () => {
+  const el = document.getElementById('msg');
+  const msg = el.value.trim();
+  const out = document.getElementById('blinkStatus');
+  if (!msg) { out.textContent = 'Type a message first.'; return; }
+  const btn = document.getElementById('blink');
+  btn.disabled = true;
+  out.textContent = 'Sent — watch the LED…';
+  try {
+    const r = await fetch('/blink', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: 'msg=' + encodeURIComponent(msg),
+    });
+    out.textContent = r.ok ? 'Blinking "' + msg + '" on the LED…' : 'Device busy, try again.';
+  } catch (e) {
+    out.textContent = 'Send failed.';
+  }
+  btn.disabled = false;
 };
 
 loadNetworks();
